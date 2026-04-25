@@ -1,0 +1,6 @@
+.env
+
+wids_local.conf
+*.log
+*.json
+*.csv

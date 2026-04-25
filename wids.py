@@ -48,10 +48,10 @@ console = Console()
 #  CONFIG
 # ============================
 CFG: dict = {
-    "monitor_iface": "wlan1", # a wifi that can packet inject/go into monitor mode
-    "scan_iface": "wlan0", # a wifi interface that cannot go into minitor mode/packet inject
-    "home_ssid": os.environ.get("WIDS_HOME_SSID", ""),
-    "home_password": os.environ.get("WIDS_HOME_PASSWORD", ""),
+    "monitor_iface": os.environ.get("WIDS_MONITOR_IFACE", "wlan1"),  # use the wifi interface that support monitor mode
+    "scan_iface": os.environ.get("WIDS_SCAN_IFACE", "wlan0"),  # can be any wifi interface, even the RPi's stock iface is ok
+    "home_ssid": os.environ.get("WIDS_HOME_SSID", "Hell's WiFi"),
+    "home_password": os.environ.get("WIDS_HOME_PASSWORD", "rectum_obliterator_666"),
     "log_dir": Path("/var/log/wids"),
     "log_file": Path("/var/log/wids/wids.log"),
     "deauth_threshold": 5,
@@ -346,8 +346,10 @@ def detect_beacon(f: dict) -> None:
         ap.frame_count += 1
         if ssid:
             ap.ssid = ssid
+            ap.hidden = False
         elif not ap.ssid:
             ap.ssid = ""
+            ap.hidden = True
         if rssi != -999:
             ap.rssi = rssi
         # Security is NOT set from beacons — tcpdump text output has no RSN IE data.
@@ -539,6 +541,37 @@ def detect_dhcp_starve(r: dict) -> None:
         if len(active) == CFG["dhcp_starve_threshold"]:
             STATE.add_alert("CRITICAL", "DHCP_STARVE",
                 f"{len(active)} unique MACs sending DHCP DISCOVER in {CFG['dhcp_starve_window']}s — starvation attack?")
+
+def pmf_reader_thread() -> None:
+    debug_log = open(CFG["log_dir"] / "tshark_pmf.log", "a")
+    cmd = ["tshark", "-i", CFG["monitor_iface"], "-l", "-n",
+           "-T", "fields",
+           "-e", "wlan.bssid",
+           "-e", "wlan.rsn.capabilities.mfpc",
+           "-e", "wlan.rsn.capabilities.mfpr",
+           "-Y", "wlan.fc.type_subtype == 8"]   # beacon frames only
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=debug_log, text=True)
+    with _PROCS_LOCK:
+        _PROCESSES.append((proc, "pmf"))
+    try:
+        for line in proc.stdout:
+            if not STATE.running: break
+            line = line.strip()
+            if not line: continue
+            parts = line.split("\t")
+            if len(parts) < 2: continue
+            bssid = parts[0].strip().upper()
+            mfpc  = parts[1].strip() in ("1", "True")
+            mfpr  = parts[2].strip() in ("1", "True") if len(parts) > 2 else False
+            if not bssid: continue
+            with STATE.lock:
+                ap = STATE.get_or_create_ap(bssid)
+                ap.mfpc = mfpc
+                ap.mfpr = mfpr
+    finally:
+        debug_log.close()
+        try: proc.terminate()
+        except: pass
 
 def lan_monitor_thread() -> None:
     while STATE.running:
@@ -1116,6 +1149,7 @@ def update_all_aps_from_nmcli() -> None:
                     ap = STATE.get_or_create_ap(bssid)
                     if ssid and ssid != "--":
                         ap.ssid = ssid
+                        ap.hidden = False
                     if chan and chan != "--":
                         try:
                             ap.channel = int(chan)
@@ -1170,6 +1204,7 @@ def main() -> None:
         (export_scheduler_thread,  "export"),
         (update_all_aps_from_nmcli,"nmcli_full"),
         (lan_monitor_thread,       "lan"),
+        (pmf_reader_thread, "pmf"),
     ]:
         threading.Thread(target=target, daemon=True, name=name).start()
     time.sleep(2)

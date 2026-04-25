@@ -4,6 +4,24 @@ A real-time Wi-Fi and LAN threat monitor for Raspberry Pi. Displays a live termi
 
 ---
 
+## Screenshots
+
+### Main Dashboard
+
+<img alt="dashboard" src=.media/Dashboard.png />
+
+### RF Radar
+
+<img alt="RF Radar" src=.media/RF_Radar.png />
+
+### Connected Clients
+
+<img alt="Connected Clients" src=.media/Connected_Clients.png />
+
+### Device Registry
+
+<img alt="Device Registry" src=.media/Device_Registry.png />
+
 ## Table of Contents
 
 1. [How It Works](#how-it-works)
@@ -264,33 +282,10 @@ nano ~/wids/wids_local.conf
 Add:
 
 ```ini
-HOME_SSID=YourNetworkName
-HOME_PASSWORD=YourWiFiPassword
-MONITOR_IFACE=wlan1
-SCAN_IFACE=wlan0
-```
-
-Then in `wids.py`, replace the hardcoded CFG values with environment variable reads at the top of the file:
-
-```python
-import os
-
-CFG: dict = {
-    "monitor_iface": os.environ.get("WIDS_MONITOR_IFACE", "wlan1"),
-    "scan_iface":    os.environ.get("WIDS_SCAN_IFACE",    "wlan0"),
-    "home_ssid":     os.environ.get("WIDS_HOME_SSID",     ""),
-    "home_password": os.environ.get("WIDS_HOME_PASSWORD", ""),
-    ...
-}
-```
-
-And ensure `wids_local.conf` is in your `.gitignore`:
-
-```bash
-echo "wids_local.conf" >> .gitignore
-echo "*.log" >> .gitignore
-echo "*.json" >> .gitignore
-echo "*.csv" >> .gitignore
+HOME_SSID=Hell`s WiFi
+HOME_PASSWORD=rectum_obliterator_666
+MONITOR_IFACE=wlan1  # use the wifi interface that support monitor mode
+SCAN_IFACE=wlan0 # can be any wifi interface, even the RPi's stock iface is ok
 ```
 
 ### Identify your interfaces
