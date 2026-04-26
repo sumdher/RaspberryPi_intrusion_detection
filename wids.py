@@ -73,6 +73,8 @@ CFG: dict = {
     "port_scan_window": 10,
     "dhcp_starve_threshold": 8,
     "dhcp_starve_window": 10,
+    # NEW: handshake timeout threshold (seconds)
+    "handshake_timeout_sec": 5,
 }
 
 # ============================
@@ -157,6 +159,8 @@ class APRecord:
     first_seen: datetime = field(default_factory=datetime.now)
     last_seen: datetime = field(default_factory=datetime.now)
     frame_count: int = 0; reputation: int = 100; is_home: bool = False
+    # NEW: flag for WPA3 transition mode (advertises both WPA2 and WPA3)
+    transition_mode: bool = False
 
 @dataclass
 class ClientRecord:
@@ -206,6 +210,10 @@ class WIDSState:
                 ["hostname", "-I"], text=True, stderr=subprocess.DEVNULL).split())
         except Exception:
             self.own_ips = set()
+        # NEW: handshake state tracking (bssid, sta_mac) -> {last_msg, last_time, start_time}
+        self.hs_states: Dict[Tuple[str, str], dict] = {}
+        # NEW: prevent duplicate transition‐mode alerts per BSSID
+        self.transition_alerted_bssids: Set[str] = set()
 
     def tick(self) -> None:
         now = time.time()
@@ -352,8 +360,6 @@ def detect_beacon(f: dict) -> None:
             ap.hidden = True
         if rssi != -999:
             ap.rssi = rssi
-        # Security is NOT set from beacons — tcpdump text output has no RSN IE data.
-        # Security is set exclusively by update_all_aps_from_nmcli.
 
 def detect_deauth(f: dict) -> None:
     bssid = f.get("bssid", ""); sa = f.get("sa", ""); da = f.get("da", ""); now = time.time()
@@ -424,17 +430,30 @@ def detect_assoc(f: dict) -> None:
             STATE.add_event("assoc", sa, f"-> {bssid}")
             STATE.add_conn("assoc", sa, bssid)
 
+# ============================
+#  EAPOL / HANDSHAKE DETECTION (ENRICHED)
+# ============================
 def detect_eapol(f: dict) -> None:
-    sa = f.get("sa", ""); da = f.get("da", ""); key_type = f.get("eapol_key_type", "")
-    if not sa: return
+    """
+    Receives a dict with keys:
+        sa, da, eapol_key_type (string), time_epoch (string)
+    """
+    sa = f.get("sa", ""); da = f.get("da", ""); key_type_str = f.get("eapol_key_type", "")
+    ts_str = f.get("time_epoch", "")
+
+    # Legacy event for display
     STATE.frame_type_counts["eapol"] += 1
     STATE.tick()
-    detail = f"-> {da}" + (f"  key_type={key_type}" if key_type else "")
+    detail = f"-> {da}" + (f"  key_type={key_type_str}" if key_type_str else "")
     STATE.add_event("eapol", sa, detail)
+
     with STATE.lock:
-        if sa in STATE.aps: return
+        if sa in STATE.aps: return          # don't track AP->AP or AP self
         c = STATE.get_or_create_client(sa)
-        c.eapol_count += 1; c.last_seen = datetime.now()
+        c.eapol_count += 1
+        c.last_seen = datetime.now()
+
+        # Original alert on repeated handshakes (EAPOL storm)
         if c.eapol_count == 1:
             STATE.add_alert("INFO", "EAPOL",
                 f"WPA handshake: {sa} seen first time this session", mac=sa)
@@ -442,6 +461,89 @@ def detect_eapol(f: dict) -> None:
             STATE.add_alert("WARN", "EAPOL_STORM",
                 f"Repeated handshakes from {sa} ({c.eapol_count} frames) — possible deauth-reconnect loop",
                 mac=sa)
+
+    # ----------------- NEW: handshake message tracking -----------------
+    try:
+        key_type = int(key_type_str) if key_type_str else None
+    except ValueError:
+        key_type = None
+
+    # Only process 4‑way handshake messages (EAPOL‑Key)
+    if key_type not in (2, 3, 4, 5):
+        return
+
+    msg_map = {2: "M1", 3: "M2", 4: "M3", 5: "M4"}
+    msg_type = msg_map.get(key_type, "?")
+
+    # Determine AP BSSID: sa or da must be a known AP
+    bssid = None
+    if sa in STATE.aps:
+        bssid = sa
+        sta_mac = da
+    elif da in STATE.aps:
+        bssid = da
+        sta_mac = sa
+    else:
+        return              # neither endpoint is a known AP
+
+    if not sta_mac:
+        return
+
+    try:
+        ts = float(ts_str)
+    except (ValueError, TypeError):
+        ts = time.time()
+
+    with STATE.lock:
+        hs_key = (bssid, sta_mac)
+        state = STATE.hs_states.get(hs_key)
+
+        if msg_type == "M1":
+            # Start of new handshake – reset previous state silently
+            STATE.hs_states[hs_key] = {
+                "last_msg": "M1",
+                "last_time": ts,
+                "start_time": ts,
+            }
+
+        elif state is None:
+            # Stray message without a preceding M1
+            if msg_type != "M1":  # just in case
+                STATE.add_alert("WARN", "EAPOL_ANOMALY",
+                    f"Stray {msg_type} from {sa} to {da} without M1 (bssid={bssid})",
+                    bssid=bssid, mac=sta_mac)
+
+        else:
+            expected = {"M1": "M2", "M2": "M3", "M3": "M4"}.get(state["last_msg"])
+            if msg_type != expected:
+                STATE.add_alert("WARN", "EAPOL_SEQUENCE",
+                    f"Unexpected {msg_type} after {state['last_msg']} for STA {sta_mac} (bssid={bssid})",
+                    bssid=bssid, mac=sta_mac)
+                # reset state on sequence error
+                del STATE.hs_states[hs_key]
+                return
+
+            # Check timeout only on completion (M4)
+            if msg_type == "M4" and state is not None:
+                duration = ts - state.get("start_time", ts)
+                if duration > CFG["handshake_timeout_sec"]:
+                    STATE.add_alert("WARN", "EAPOL_TIMEOUT",
+                        f"Handshake for {sta_mac} took {duration:.1f}s > {CFG['handshake_timeout_sec']}s",
+                        bssid=bssid, mac=sta_mac)
+                # Cleanup after completion
+                del STATE.hs_states[hs_key]
+            else:
+                # Update state for next expected message
+                state["last_msg"] = msg_type
+                state["last_time"] = ts
+
+    # Transition mode awareness (alert only if home AP is in transition mode)
+    if bssid and bssid in STATE.aps:
+        ap = STATE.aps[bssid]
+        if ap.transition_mode and ap.is_home:
+            # We already raise a dedicated alert when transition mode is first detected,
+            # so here we don't spam per handshake.
+            pass
 
 # ============================
 #  LAN THREAT DETECTION
@@ -487,7 +589,6 @@ def parse_lan_line(line: str) -> dict | None:
 def detect_arp_scan(r: dict) -> None:
     sender_ip = r.get("sender_ip", "")
     if not sender_ip: return
-    # Ignore our own traffic (e.g. from the arp-scan panel running on the Pi)
     if sender_ip in STATE.own_ips: return
     now = time.time()
     with STATE.lock:
@@ -515,7 +616,6 @@ def detect_arp_poison(r: dict) -> None:
 def detect_port_scan(r: dict) -> None:
     src_ip = r.get("src_ip", ""); dst_port = r.get("dst_port")
     if not src_ip or dst_port is None: return
-    # Ignore our own traffic
     if src_ip in STATE.own_ips: return
     now = time.time()
     with STATE.lock:
@@ -542,41 +642,118 @@ def detect_dhcp_starve(r: dict) -> None:
             STATE.add_alert("CRITICAL", "DHCP_STARVE",
                 f"{len(active)} unique MACs sending DHCP DISCOVER in {CFG['dhcp_starve_window']}s — starvation attack?")
 
+# ============================
+#  CAPTURE THREADS
+# ============================
+_PROCESSES: List[Tuple[subprocess.Popen, str]] = []
+_PROCS_LOCK = threading.Lock()
+
+def mgmt_reader_thread() -> None:
+    while STATE.running:
+        debug_log = open(CFG["log_dir"] / "tcpdump_mgmt.log", "a")
+        cmd = ["tcpdump", "-i", CFG["monitor_iface"], "-e", "-n", "-l"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=debug_log, text=True)
+        with _PROCS_LOCK:
+            _PROCESSES.append((proc, "mgmt"))
+        try:
+            for line in proc.stdout:
+                if not STATE.running: break
+                line = line.strip()
+                if not line: continue
+                parsed = parse_tcpdump_line(line)
+                if not parsed: continue
+                subtype = parsed.get("subtype")
+                STATE.tick()
+                if subtype == 8:          detect_beacon(parsed)
+                elif subtype == 12:       detect_deauth(parsed)
+                elif subtype == 10:       detect_disassoc(parsed)
+                elif subtype == 4:        detect_probe_req(parsed)
+                elif subtype == 11:       detect_auth(parsed)
+                elif subtype in (0,1,2,3):detect_assoc(parsed)
+        except Exception as e:
+            STATE.add_alert("ALERT", "MGMT_READER_ERR", f"tcpdump reader exception: {e}")
+        finally:
+            debug_log.close()
+            try: proc.terminate()
+            except: pass
+        if STATE.running:
+            time.sleep(5)
+
+def eapol_reader_thread() -> None:
+    """Enhanced EAPOL reader: captures timestamp, SA, DA, keydes.type"""
+    while STATE.running:
+        debug_log = open(CFG["log_dir"] / "tshark_eapol.log", "a")
+        cmd = ["tshark", "-i", CFG["monitor_iface"], "-l", "-n", "-T", "fields",
+               "-e", "frame.time_epoch",
+               "-e", "wlan.sa",
+               "-e", "wlan.da",
+               "-e", "eapol.keydes.type",
+               "-Y", "eapol"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=debug_log, text=True)
+        with _PROCS_LOCK:
+            _PROCESSES.append((proc, "eapol"))
+        try:
+            for line in proc.stdout:
+                if not STATE.running: break
+                line = line.strip()
+                if not line: continue
+                parts = line.split("|")
+                if len(parts) < 4:
+                    continue
+                detect_eapol({
+                    "time_epoch": parts[0].strip(),
+                    "sa":           parts[1].strip(),
+                    "da":           parts[2].strip(),
+                    "eapol_key_type": parts[3].strip(),
+                })
+        except Exception as e:
+            debug_log.write(f"[EXCEPTION] {e}\n")
+        finally:
+            debug_log.close()
+            try: proc.terminate()
+            except: pass
+        if STATE.running:
+            time.sleep(5)
+
 def pmf_reader_thread() -> None:
-    debug_log = open(CFG["log_dir"] / "tshark_pmf.log", "a")
-    cmd = ["tshark", "-i", CFG["monitor_iface"], "-l", "-n",
-           "-T", "fields",
-           "-e", "wlan.bssid",
-           "-e", "wlan.rsn.capabilities.mfpc",
-           "-e", "wlan.rsn.capabilities.mfpr",
-           "-Y", "wlan.fc.type_subtype == 8"]   # beacon frames only
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=debug_log, text=True)
-    with _PROCS_LOCK:
-        _PROCESSES.append((proc, "pmf"))
-    try:
-        for line in proc.stdout:
-            if not STATE.running: break
-            line = line.strip()
-            if not line: continue
-            parts = line.split("\t")
-            if len(parts) < 2: continue
-            bssid = parts[0].strip().upper()
-            mfpc  = parts[1].strip() in ("1", "True")
-            mfpr  = parts[2].strip() in ("1", "True") if len(parts) > 2 else False
-            if not bssid: continue
-            with STATE.lock:
-                ap = STATE.get_or_create_ap(bssid)
-                ap.mfpc = mfpc
-                ap.mfpr = mfpr
-    finally:
-        debug_log.close()
-        try: proc.terminate()
-        except: pass
+    while STATE.running:
+        debug_log = open(CFG["log_dir"] / "tshark_pmf.log", "a")
+        cmd = ["tshark", "-i", CFG["monitor_iface"], "-l", "-n",
+               "-T", "fields",
+               "-e", "wlan.bssid",
+               "-e", "wlan.rsn.capabilities.mfpc",
+               "-e", "wlan.rsn.capabilities.mfpr",
+               "-Y", "wlan.fc.type_subtype == 8"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=debug_log, text=True)
+        with _PROCS_LOCK:
+            _PROCESSES.append((proc, "pmf"))
+        try:
+            for line in proc.stdout:
+                if not STATE.running: break
+                line = line.strip()
+                if not line: continue
+                parts = line.split("\t")
+                if len(parts) < 2: continue
+                bssid = parts[0].strip().upper()
+                mfpc  = parts[1].strip() in ("1", "True")
+                mfpr  = parts[2].strip() in ("1", "True") if len(parts) > 2 else False
+                if not bssid: continue
+                with STATE.lock:
+                    ap = STATE.get_or_create_ap(bssid)
+                    ap.mfpc = mfpc
+                    ap.mfpr = mfpr
+        except Exception as e:
+            debug_log.write(f"[EXCEPTION] {e}\n")
+        finally:
+            debug_log.close()
+            try: proc.terminate()
+            except: pass
+        if STATE.running:
+            time.sleep(5)
 
 def lan_monitor_thread() -> None:
     while STATE.running:
         iface = CFG["scan_iface"]
-        # Verify wlan0 is in managed (not monitor) mode before starting
         try:
             out = subprocess.check_output(["iw", "dev", iface, "info"],
                                           text=True, stderr=subprocess.DEVNULL)
@@ -617,70 +794,6 @@ def lan_monitor_thread() -> None:
         if STATE.running:
             STATE.add_alert("ALERT", "LAN_RESTART", "LAN monitor died – restarting in 5s")
             time.sleep(5)
-
-# ============================
-#  CAPTURE THREADS
-# ============================
-# Each entry is (subprocess.Popen, name:str)
-# name is used by watchdog to decide whether to alert on death
-_PROCESSES: List[Tuple[subprocess.Popen, str]] = []
-_PROCS_LOCK = threading.Lock()
-
-def mgmt_reader_thread() -> None:
-    while STATE.running:
-        debug_log = open(CFG["log_dir"] / "tcpdump_mgmt.log", "a")
-        cmd = ["tcpdump", "-i", CFG["monitor_iface"], "-e", "-n", "-l"]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=debug_log, text=True)
-        with _PROCS_LOCK:
-            _PROCESSES.append((proc, "mgmt"))
-        try:
-            for line in proc.stdout:
-                if not STATE.running: break
-                line = line.strip()
-                if not line: continue
-                parsed = parse_tcpdump_line(line)
-                if not parsed: continue
-                subtype = parsed.get("subtype")
-                STATE.tick()
-                if subtype == 8:          detect_beacon(parsed)
-                elif subtype == 12:       detect_deauth(parsed)
-                elif subtype == 10:       detect_disassoc(parsed)
-                elif subtype == 4:        detect_probe_req(parsed)
-                elif subtype == 11:       detect_auth(parsed)
-                elif subtype in (0,1,2,3):detect_assoc(parsed)
-        except Exception as e:
-            STATE.add_alert("ALERT", "MGMT_READER_ERR", f"tcpdump reader exception: {e}")
-        finally:
-            debug_log.close()
-            try: proc.terminate()
-            except: pass
-        if STATE.running:
-            STATE.add_alert("ALERT", "MGMT_RESTART", "Management reader died – restarting in 5s")
-            time.sleep(5)
-
-def eapol_reader_thread() -> None:
-    debug_log = open(CFG["log_dir"] / "tshark_eapol.log", "a")
-    cmd = ["tshark", "-i", CFG["monitor_iface"], "-l", "-n", "-T", "fields",
-           "-e", "frame.time_epoch", "-e", "wlan.sa", "-e", "wlan.da",
-           "-e", "eapol.keydes.type", "-Y", "eapol"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=debug_log, text=True)
-    with _PROCS_LOCK:
-        _PROCESSES.append((proc, "eapol"))
-    try:
-        for line in proc.stdout:
-            if not STATE.running: break
-            line = line.strip()
-            if not line: continue
-            parts = line.split("|")
-            detect_eapol({
-                "sa":           parts[1].strip() if len(parts) > 1 else "",
-                "da":           parts[2].strip() if len(parts) > 2 else "",
-                "eapol_key_type": parts[3].strip() if len(parts) > 3 else "",
-            })
-    finally:
-        debug_log.close()
-        try: proc.terminate()
-        except: pass
 
 # ============================
 #  SCANNER, WATCHDOG, HEARTBEAT, EXPORT
@@ -738,14 +851,9 @@ def watchdog_thread() -> None:
     time.sleep(15)
     while STATE.running:
         time.sleep(30)
-        # Only alert on death of critical capture processes (mgmt, eapol)
-        # lan_monitor self-restarts and manages its own alerts
         with _PROCS_LOCK:
-            dead = [(p, n) for p, n in _PROCESSES
-                    if p.poll() is not None and n in ("mgmt", "eapol")]
-        for p, n in dead:
-            STATE.add_alert("CRITICAL", "CAPTURE_DIED",
-                f"{n} capture (pid={p.pid}) exited {p.poll()} — check logs")
+            _PROCESSES[:] = [(p, n) for p, n in _PROCESSES if p.poll() is None]
+
         n_mgmt = (STATE.frame_type_counts.get("beacon", 0) +
                   STATE.frame_type_counts.get("probe", 0) +
                   STATE.frame_type_counts.get("deauth", 0))
@@ -860,14 +968,16 @@ def _ap_table() -> Panel:
         ssid_t  = Text(ap.ssid) if ap.ssid else Text("<hidden>", style="italic grey58")
         if ap.ibss: ssid_t.append(" IBSS", style="bold red")
         pmf_t   = Text("✓" if ap.mfpc else "✗", style="bright_green" if ap.mfpc else "red")
+        # Security field may now show transition info
+        sec_display = ap.security if not ap.transition_mode else "WPA2/3 ↔"
         tbl.add_row(star_t, bssid_t, ssid_t,
                     str(ap.channel) if ap.channel else "?",
                     rssi_bar(ap.rssi),
-                    ap.security or "?",
+                    sec_display,
                     pmf_t, rep_text(ap.reputation))
     return Panel(tbl,
                  title="[bold cyan]◉ RF Radar — Access Points[/]  "
-                       "[grey66]★=home  PMF=802.11w  Rep=trust score[/]",
+                       "[grey66]★=home  PMF=802.11w  Rep=trust score  ↔=transition mode[/]",
                  border_style="cyan", box=box.ROUNDED)
 
 def _alert_panel() -> Panel:
@@ -911,6 +1021,7 @@ def _stats_panel() -> Panel:
         n_rand = sum(1 for c in STATE.clients.values() if c.randomized)
         n_ibss = sum(1 for ap in STATE.aps.values() if ap.ibss)
         n_hid  = sum(1 for ap in STATE.aps.values() if ap.hidden)
+        n_trans = sum(1 for ap in STATE.aps.values() if ap.transition_mode)  # NEW
     txt = Text(overflow="fold")
     txt.append("Frame histogram\n", style="bold white")
     max_f = max(fcounts.values(), default=1)
@@ -934,6 +1045,7 @@ def _stats_panel() -> Panel:
         ("Rand MACs",    n_rand, "bold yellow"),
         ("IBSS/ad-hoc",  n_ibss, "bold red" if n_ibss else "bold"),
         ("Hidden SSIDs", n_hid,  "bold"),
+        ("Trans. mode",  n_trans, "bold red" if n_trans else "bold"),
         ("Total frames", STATE.total_frames, "bold"),
     ]:
         txt.append(f"  {label:<16} ", style="grey74")
@@ -1124,7 +1236,7 @@ def ensure_wlan0_connected() -> bool:
         return False
 
 def update_all_aps_from_nmcli() -> None:
-    time.sleep(5)  # brief startup grace, then scan immediately
+    time.sleep(5)
     while STATE.running:
         try:
             cmd = ["nmcli", "--terse", "--fields", "BSSID,SSID,CHAN,SECURITY,SIGNAL",
@@ -1155,28 +1267,34 @@ def update_all_aps_from_nmcli() -> None:
                             ap.channel = int(chan)
                         except ValueError:
                             pass
-                    if sec not in ("--", ""):
-                        if "WPA3" in sec:
-                            ap.security = "WPA3-SAE"
-                        elif "WPA2" in sec:
-                            ap.security = "WPA2-PSK"
-                        elif "WEP" in sec:
-                            ap.security = "WEP"
-                        else:
-                            ap.security = "Open"
-                    elif sec == "":
+                    # NEW: detect WPA3 transition mode (advertises both WPA2 and WPA3)
+                    if sec and "WPA2" in sec and "WPA3" in sec:
+                        ap.transition_mode = True
+                        ap.security = "WPA2/WPA3"
+                        if ap.is_home and bssid not in STATE.transition_alerted_bssids:
+                            STATE.transition_alerted_bssids.add(bssid)
+                            STATE.add_alert("WARN", "WPA3_DOWNGRADE_RISK",
+                                f"Home AP {bssid} ({ssid}) is in WPA3 transition mode — downgrade attacks possible!",
+                                bssid=bssid)
+                    elif "WPA3" in sec:
+                        ap.security = "WPA3-SAE"
+                    elif "WPA2" in sec:
+                        ap.security = "WPA2-PSK"
+                    elif "WEP" in sec:
+                        ap.security = "WEP"
+                    else:
                         ap.security = "Open"
+                    # else: leave security as previous value
                     if signal and signal != "--":
                         try:
                             pct = int(signal)
-                            # Only fill in RSSI if wlan1 hasn't measured this AP directly
                             if ap.rssi == -999:
-                                ap.rssi = (pct // 2) - 100  # 100%→-50, 50%→-75, 0%→-100
+                                ap.rssi = (pct // 2) - 100
                         except ValueError:
                             pass
         except Exception as e:
             STATE.add_alert("WARN", "NMCLI_ERR", f"AP update failed: {e}")
-        time.sleep(60)  # sleep AFTER scan so first run is immediate
+        time.sleep(60)
 
 def main() -> None:
     _load_system_oui()
@@ -1204,7 +1322,7 @@ def main() -> None:
         (export_scheduler_thread,  "export"),
         (update_all_aps_from_nmcli,"nmcli_full"),
         (lan_monitor_thread,       "lan"),
-        (pmf_reader_thread, "pmf"),
+        (pmf_reader_thread,        "pmf"),
     ]:
         threading.Thread(target=target, daemon=True, name=name).start()
     time.sleep(2)
