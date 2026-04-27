@@ -14,9 +14,9 @@ A real-time Wi-Fi and LAN threat CLI monitor for Raspberry Pi. Displays a live t
 
 <img alt="RF Radar" src=.media/RF_Radar.png />
 
-### Connected Clients
+### Network Stats
 
-<img alt="Connected Clients" src=.media/Connected_Clients.png />
+<img alt="Connected Clients" src=.media/Network_Stats.png />
 
 ### Device Registry
 
