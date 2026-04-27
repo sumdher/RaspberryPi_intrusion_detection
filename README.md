@@ -16,7 +16,7 @@ A real-time Wi-Fi and LAN threat CLI monitor for Raspberry Pi. Displays a live t
 
 ### Network Stats
 
-<img alt="Connected Clients" src=.media/Network_Stats.png />
+<img alt="Network Stats" src=.media/Network_Stats.png />
 
 ### Device Registry
 
