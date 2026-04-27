@@ -42,9 +42,9 @@ console = Console()
 # ---------- Configuration ----------
 CFG: dict = {
     "monitor_iface": os.environ.get("WIDS_MONITOR_IFACE", "wlan1"),
-    "scan_iface":    os.environ.get("WIDS_SCAN_IFACE",    "wlan0"),
-    "home_ssid":     os.environ.get("WIDS_HOME_SSID",     "MyHomeNetwork"),
-    "home_password": os.environ.get("WIDS_HOME_PASSWORD", "_"),
+    "scan_iface":    os.environ.get("WIDS_SCAN_IFACE", "wlan0"),
+    "home_ssid":     os.environ.get("WIDS_HOME_SSID", "Hell`s WiFi"),
+    "home_password": os.environ.get("WIDS_HOME_PASSWORD", "rectum_obliterator_666"),
     "base_log_dir":  Path("/var/log/wids/sessions"),
     "ml_flush_sec":  30,
     "ml_max_file_mb": 128,
