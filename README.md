@@ -10,6 +10,10 @@ A real-time Wi-Fi and LAN threat CLI monitor for Raspberry Pi. Displays a live t
 
 <img alt="dashboard" src=.media/Dashboard.png />
 
+### Alert Feed
+
+<img alt="Alert Feed" src=.media/Alert_Feed.png />
+
 ### RF Radar
 
 <img alt="RF Radar" src=.media/RF_Radar.png />
@@ -18,9 +22,10 @@ A real-time Wi-Fi and LAN threat CLI monitor for Raspberry Pi. Displays a live t
 
 <img alt="Network Stats" src=.media/Network_Stats.png />
 
-### Device Registry
+<!-- ### Device Registry
 
-<img alt="Device Registry" src=.media/Device_Registry.png />
+<img alt="Device Registry" src=.media/Device_Registry.png /> -->
+
 
 ## Table of Contents
 
