@@ -1,7 +1,8 @@
 # WIDS — Wi-Fi Intrusion Detection System
 
-A real-time Wi-Fi and LAN threat CLI monitor for Raspberry Pi. Displays a live terminal dashboard (uses TMUX) showing all activity: deauth attacks, probe floods, nearby access points, connected devices, management frame activity, and active LAN threat detection (ARP scanning, ARP poisoning/MITM, port scanning, DHCP starvation).
+A real-time CLI + web Wi-Fi and LAN threat monitor for Raspberry Pi. Displays a live dashboard (uses TMUX) showing all activity: deauth attacks, probe floods, nearby access points, connected devices, management frame activity, and active LAN threat detection (ARP scanning, ARP poisoning/MITM, port scanning, DHCP starvation).
 
+Requires: WiFi interface with monitot mode.
 ---
 
 ## Screenshots
