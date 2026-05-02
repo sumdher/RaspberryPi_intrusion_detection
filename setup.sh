@@ -1,6 +1,56 @@
-# Attach to the live WIDS TUI from any SSH session.
-# Usage:  wids-attach  (no sudo needed if your user can sudo tmux)
+#!/usr/bin/env bash
+# setup.sh — install wids as a systemd service
+set -euo pipefail
 
+SERVICE="wids"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WIDS_PY="$SCRIPT_DIR/wids.py"
+ENV_FILE="$SCRIPT_DIR/.env"
+
+# ── require root ──────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+    echo "Run with sudo:  sudo bash setup.sh"
+    exit 1
+fi
+
+# ── env file ──────────────────────────────────────────────────
+if [[ ! -f "$ENV_FILE" ]]; then
+    if [[ -f "$SCRIPT_DIR/.env.example" ]]; then
+        cp "$SCRIPT_DIR/.env.example" "$ENV_FILE"
+        echo "[!] Created $ENV_FILE from .env.example — edit it before continuing."
+        echo "    Then re-run:  sudo bash setup.sh"
+        exit 0
+    fi
+fi
+
+# ── log directory ─────────────────────────────────────────────
+mkdir -p /var/log/wids/sessions
+chmod 755 /var/log/wids
+
+# ── systemd unit ──────────────────────────────────────────────
+cat > /etc/systemd/system/wids.service <<EOF
+[Unit]
+Description=Wi-Fi Intrusion Detection System (WIDS)
+After=network.target
+
+[Service]
+Type=forking
+ExecStartPre=-/usr/bin/tmux kill-session -t wids
+ExecStart=/usr/bin/tmux new-session -d -s wids /usr/bin/python3 $WIDS_PY
+ExecStop=/usr/bin/tmux kill-session -t wids
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=-$ENV_FILE
+StandardOutput=append:/var/log/wids/wids.log
+StandardError=append:/var/log/wids/wids.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ── wids-attach helper ────────────────────────────────────────
+cat > /usr/local/bin/wids-attach <<'EOF'
+#!/usr/bin/env bash
 SESSION="wids"
 
 if ! sudo tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -16,7 +66,11 @@ EOF
 
 chmod +x /usr/local/bin/wids-attach
 
-# ── start now ────────────────────────────────────────────────
+# ── reload & enable ───────────────────────────────────────────
+systemctl daemon-reload
+systemctl enable "$SERVICE"
+
+# ── start now ─────────────────────────────────────────────────
 echo ""
 echo "Starting service …"
 systemctl start "$SERVICE"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WIDS – Wi-Fi Intrusion Detection System with per-session Parquet ML logging.
+WIDS - Wi-Fi Intrusion Detection System with per-session Parquet ML logging.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -37,14 +37,24 @@ try:
 except ImportError:
     sys.exit("Missing 'pandas' or 'fastparquet'. Install: sudo pip install pandas fastparquet --break-system-packages")
 
+try:
+    from netaddr import EUI, NotRegisteredError as _OUINotFound
+    _NETADDR_OUI = True
+except ImportError:
+    EUI = None  # type: ignore
+    _OUINotFound = Exception
+    _NETADDR_OUI = False
+
+_OUI_FALLBACK: Dict[str, str] = {}  # populated from ieee-data if netaddr unavailable
+
 console = Console()
 
 # ---------- Configuration ----------
 CFG: dict = {
-    "monitor_iface": os.environ.get("WIDS_MONITOR_IFACE", "wlan1"),
-    "scan_iface":    os.environ.get("WIDS_SCAN_IFACE", "wlan0"),
-    "home_ssid":     os.environ.get("WIDS_HOME_SSID", "Hell`s WiFi"),
-    "home_password": os.environ.get("WIDS_HOME_PASSWORD", "rectum_obliterator_666"),
+    "monitor_iface": os.environ.get("MONITOR_IFACE", "wlan1"),
+    "scan_iface":    os.environ.get("SCAN_IFACE", "wlan0"),
+    "home_ssid":     os.environ.get("HOME_SSID", "Hell`s WiFi"),
+    "home_password": os.environ.get("HOME_PASSWORD", "rectum_obliterator_666"),
     "base_log_dir":  Path("/var/log/wids/sessions"),
     "ml_flush_sec":  30,
     "ml_max_file_mb": 128,
@@ -68,28 +78,13 @@ CFG: dict = {
     "dhcp_starve_threshold":  8,
     "dhcp_starve_window":    10,
     "handshake_timeout_sec":  5,
-    "client_inventory_interval": 300,
+    "client_inventory_interval": 60,
+    "client_stale_sec": 600,
 }
 
 SESSION_DIR: Path = CFG["base_log_dir"]
 
 # ---------- Lookup tables ----------
-_OUI: Dict[str, str] = {
-    "B8:27:EB": "Raspberry Pi", "DC:A6:32": "Raspberry Pi", "E4:5F:01": "Raspberry Pi",
-    "AC:87:A3": "Apple",        "F8:FF:C2": "Apple",        "3C:15:C2": "Apple",
-    "00:1C:BF": "Intel",        "10:02:B5": "Intel",        "34:DE:1A": "Intel",
-    "60:F6:77": "Qualcomm",     "00:17:C9": "Qualcomm",
-    "00:26:82": "TP-Link",      "50:C7:BF": "TP-Link",      "E8:65:D4": "TP-Link",
-    "00:18:4D": "Netgear",      "A0:21:B7": "Netgear",      "28:C6:8E": "Netgear",
-    "DC:9F:DB": "Ubiquiti",     "24:A4:3C": "Ubiquiti",     "FC:EC:DA": "Ubiquiti",
-    "4C:1F:CC": "Huawei",       "28:6E:D4": "Huawei",
-    "28:D2:44": "ASUS",         "04:D4:C4": "ASUS",
-    "00:1C:C0": "D-Link",       "1C:BD:B9": "D-Link",
-    "50:32:37": "Samsung",      "FC:00:12": "Samsung",
-    "54:60:09": "Google",       "F4:F5:D8": "Google",
-    "00:50:F2": "Microsoft",    "00:15:5D": "MS/HyperV",
-    "00:0C:E7": "Cisco",        "00:23:69": "Cisco",
-}
 
 REASON_CODES: Dict[int, str] = {
     1: "Unspecified",     2: "Auth expired",     3: "Leaving BSS",     4: "Inactivity",
@@ -109,9 +104,9 @@ AKM_TYPES: Dict[int, str] = {
     5: "802.1X-S256", 6: "PSK-S256", 8: "SAE", 9: "FT-SAE", 18: "OWE",
 }
 
-# ---------- OUI loading ----------
-def _load_system_oui() -> None:
-    for path in ["/usr/share/ieee-data/oui.txt", "/usr/share/wireshark/manuf", "/usr/share/arp-scan/ieee-oui.txt"]:
+def _load_oui_fallback() -> None:
+    for path in ["/usr/share/ieee-data/oui.txt", "/usr/share/wireshark/manuf",
+                 "/usr/share/arp-scan/oui.txt"]:
         if not os.path.exists(path):
             continue
         try:
@@ -125,20 +120,27 @@ def _load_system_oui() -> None:
                         if len(parts) >= 3:
                             oui = parts[0].replace("-", ":")
                             vendor = " ".join(parts[2:]).strip()[:20]
-                            if oui not in _OUI and vendor:
-                                _OUI[oui] = vendor
+                            if oui not in _OUI_FALLBACK and vendor:
+                                _OUI_FALLBACK[oui] = vendor
                     else:
                         parts = re.split(r"\s+", line, maxsplit=1)
                         if len(parts) >= 2:
                             oui = parts[0].upper().replace("-", ":").replace("_", ":")[:8]
                             vendor = parts[1].strip()[:20]
-                            if oui not in _OUI and vendor:
-                                _OUI[oui] = vendor
+                            if oui not in _OUI_FALLBACK and vendor:
+                                _OUI_FALLBACK[oui] = vendor
+            if _OUI_FALLBACK:
+                break
         except Exception:
             pass
 
 def oui_lookup(mac: str) -> str:
-    return _OUI.get(mac.upper().replace("-", ":")[:8], "Unknown")
+    if _NETADDR_OUI:
+        try:
+            return EUI(mac).oui.registration().org[:20]
+        except (_OUINotFound, Exception):
+            pass
+    return _OUI_FALLBACK.get(mac.upper().replace("-", ":")[:8], "Unknown")
 
 def is_randomized_mac(mac: str) -> bool:
     try:
@@ -1237,6 +1239,11 @@ def watchdog_thread() -> None:
 def heartbeat_thread() -> None:
     while STATE.running:
         time.sleep(CFG["heartbeat_interval"])
+        cutoff = datetime.now() - timedelta(seconds=CFG["client_stale_sec"])
+        with STATE.lock:
+            stale = [m for m, c in STATE.clients.items() if c.last_seen < cutoff]
+            for m in stale:
+                del STATE.clients[m]
         STATE.add_event("heartbeat", "—",
             f"ch={STATE.home_channel or '?'}  APs={len(STATE.aps)}  "
             f"clients={len(STATE.clients)}  {round(STATE.fps(), 1)} fr/s  "
@@ -1677,7 +1684,8 @@ def shutdown(sig=None, frame=None) -> None:
 def main() -> None:
     global LOG, ML, SESSION_DIR
 
-    _load_system_oui()
+    if not _NETADDR_OUI:
+        _load_oui_fallback()
     if os.geteuid() != 0:
         sys.exit("Run as root: sudo python3 wids.py")
     if not check_deps():
